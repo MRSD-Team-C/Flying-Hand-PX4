@@ -163,7 +163,11 @@ void PositionControl::_velocityControl(const float dt)
 	const float thrust_max_squared = math::sq(_lim_thr_max);
 
 	// Determine how much vertical thrust is left keeping horizontal margin
-	const float allocated_horizontal_thrust = math::min(thrust_sp_xy_norm, _lim_thr_xy_margin);
+	const float horizontal_margin_max = isOmniMode()
+					    ? sqrtf(math::max(0.f, thrust_max_squared - math::sq(_lim_thr_min)))
+					    : _lim_thr_max;
+	const float allocated_horizontal_thrust = math::min(thrust_sp_xy_norm,
+			math::min(_lim_thr_xy_margin, horizontal_margin_max));
 	const float thrust_z_max_squared = thrust_max_squared - math::sq(allocated_horizontal_thrust);
 
 	// Saturate maximal vertical thrust
@@ -175,6 +179,13 @@ void PositionControl::_velocityControl(const float dt)
 
 	if (thrust_max_xy_squared > 0.f) {
 		thrust_max_xy = sqrtf(thrust_max_xy_squared);
+	}
+
+	if (isOmniMode()) {
+		// Apply the horizontal envelope to the same NED vector used by anti-windup
+		// and attitude conversion. Keep the standard tilt envelope for fallback.
+		thrust_max_xy = math::min(thrust_max_xy, math::max(_omni_dfc_max_thrust, 0.f));
+		thrust_max_xy = math::min(thrust_max_xy, -_thr_sp(2) * tanf(_lim_tilt));
 	}
 
 	// Saturate thrust in horizontal direction
@@ -203,6 +214,14 @@ void PositionControl::_velocityControl(const float dt)
 
 void PositionControl::_accelerationControl()
 {
+	if (isOmniMode()) {
+		// Fully actuated vehicles produce force without tilting the body. Compute
+		// it here so minimum/maximum limits and anti-windup act on the real output.
+		_thr_sp = _acc_sp * (_hover_thrust / CONSTANTS_ONE_G) - Vector3f(0.f, 0.f, _hover_thrust);
+		_thr_sp(2) = math::min(_thr_sp(2), -_lim_thr_min);
+		return;
+	}
+
 	// Assume standard acceleration due to gravity in vertical direction for attitude generation
 	float z_specific_force = -CONSTANTS_ONE_G;
 
@@ -269,12 +288,43 @@ void PositionControl::getAttitudeSetpoint(vehicle_attitude_setpoint_s &attitude_
 	attitude_setpoint.yaw_sp_move_rate = _yawspeed_sp;
 }
 
-void PositionControl::getOmniAttitudeSetpoint(vehicle_attitude_setpoint_s &attitude_setpoint,
+bool PositionControl::getOmniAttitudeSetpoint(vehicle_attitude_setpoint_s &attitude_setpoint,
 		omni_attitude_status_s &omni_status)
 {
-	// For omnidirectional mode, compute the NED thrust vector directly from acceleration
-	// without coupling to body tilt (unlike standard _accelerationControl)
-	Vector3f thr_sp_ned = _acc_sp * (_hover_thrust / CONSTANTS_ONE_G) - Vector3f(0.f, 0.f, _hover_thrust);
+	// Prepare a finite conventional fallback before evaluating the omni path.
+	// Do not let a failed conversion turn NaN thrust into motor-stop commands.
+	attitude_setpoint = {};
+	omni_status = {};
+	const float max_thrust = PX4_ISFINITE(_lim_thr_max) ? math::constrain(_lim_thr_max, .001f, 1.f) : .5f;
+	Vector3f fallback_thrust = _thr_sp;
+
+	if (!fallback_thrust.isAllFinite() || !PX4_ISFINITE(fallback_thrust.norm()) || fallback_thrust(2) >= 0.f) {
+		const float hover_thrust = PX4_ISFINITE(_hover_thrust)
+					   ? math::constrain(_hover_thrust, .001f, max_thrust) : max_thrust;
+		fallback_thrust = Vector3f(0.f, 0.f, -hover_thrust);
+	}
+
+	if (fallback_thrust.norm() > max_thrust) {
+		fallback_thrust *= max_thrust / fallback_thrust.norm();
+	}
+
+	ControlMath::thrustToAttitude(fallback_thrust, PX4_ISFINITE(_yaw_sp) ? _yaw_sp : 0.f, attitude_setpoint);
+	attitude_setpoint.yaw_sp_move_rate = PX4_ISFINITE(_yawspeed_sp) ? _yawspeed_sp : 0.f;
+
+	const float attitude_norm_squared = _att.norm_squared();
+
+	if (!_thr_sp.isAllFinite() || !PX4_ISFINITE(_yaw_sp) || !_att.isAllFinite()
+	    || attitude_norm_squared < .5f || attitude_norm_squared > 1.5f
+	    || _omni_att_mode < 1 || _omni_att_mode > 6 || _omni_proj_axes < 0 || _omni_proj_axes > 1
+	    || !PX4_ISFINITE(_omni_dfc_max_thrust) || !PX4_ISFINITE(_omni_att_tilt_angle)
+	    || !PX4_ISFINITE(_omni_att_tilt_dir) || !PX4_ISFINITE(_omni_att_roll)
+	    || !PX4_ISFINITE(_omni_att_pitch) || !PX4_ISFINITE(_omni_att_rate) || _omni_att_rate < 0.f) {
+		return false;
+	}
+
+	vehicle_attitude_setpoint_s candidate{};
+	omni_attitude_status_s candidate_status{};
+	const Quatf attitude = _att.normalized();
 
 	// Use omnidirectional attitude conversion
 	float tilt_angle = _omni_att_tilt_angle;
@@ -282,12 +332,24 @@ void PositionControl::getOmniAttitudeSetpoint(vehicle_attitude_setpoint_s &attit
 	float roll = _omni_att_roll;
 	float pitch = _omni_att_pitch;
 
-	ControlMath::thrustToOmniAttitude(thr_sp_ned, _yaw_sp, _att,
+	ControlMath::thrustToOmniAttitude(_thr_sp, _yaw_sp, attitude,
 					  _omni_att_mode, _omni_dfc_max_thrust,
 					  tilt_angle, tilt_dir, roll, pitch,
 					  _omni_att_rate, _omni_proj_axes,
-					  attitude_setpoint, omni_status);
+					  candidate, candidate_status);
+
+	const Quatf q(candidate.q_d);
+	const Vector3f thrust(candidate.thrust_body);
+
+	if (!q.isAllFinite() || !thrust.isAllFinite() || fabsf(q.norm_squared() - 1.f) > .001f
+	    || thrust.norm() > max_thrust + 1e-4f || thrust(2) > 0.f) {
+		return false;
+	}
+
+	attitude_setpoint = candidate;
+	omni_status = candidate_status;
 
 	attitude_setpoint.yaw_sp_move_rate = _yawspeed_sp;
 	omni_status.att_mode = (float)_omni_att_mode;
+	return true;
 }
